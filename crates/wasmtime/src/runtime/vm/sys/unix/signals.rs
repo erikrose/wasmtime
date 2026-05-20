@@ -1,6 +1,7 @@
 //! Trap handling on Unix based on POSIX signals.
 
 use crate::prelude::*;
+use crate::runtime::module::lookup_code;
 use crate::runtime::vm::traphandlers::{TrapRegisters, TrapTest, tls};
 use std::cell::RefCell;
 use std::io;
@@ -18,6 +19,10 @@ static mut PREV_SIGBUS: libc::sigaction = UNINIT_SIGACTION;
 static mut PREV_SIGILL: libc::sigaction = UNINIT_SIGACTION;
 static mut PREV_SIGFPE: libc::sigaction = UNINIT_SIGACTION;
 
+// From signal.h. Not yet exposed in libc. Value is valid for Linux and Mac; not
+// sure about elsewhere.
+#[cfg(all(target_os = "linux"))]
+const SEGV_ACCERR: libc::c_int = 2;
 pub struct TrapHandler;
 
 impl TrapHandler {
@@ -141,12 +146,52 @@ unsafe extern "C" fn trap_handler(
         _ => panic!("unknown signal: {signum}"),
     };
     let handled = tls::with(|info| {
+        // Put something like this somewhere in this function, not necessarily here.
+        //
+        // if it is a SIGSEGV and siginfo.si_code == SEGV_ACCERR {
+        // It might be an epoch-switching segfault.
+        // PC (to see if it's a dead-load-with-context instr) can be got from ucontext_t.uc_mcontext.gregs[libc::REG_RIP as usize]—https://github.com/bytecodealliance/wasmtime/pull/11826/changes#diff-9a743b05b6a03d0ed59ce31ff3cb16d738a261a712f58748221ad8327da5ced8R247
+        // You can change the return address by frobbing cs.uc_mcontext.gregs[libc::REG:RIP], as at https://github.com/bytecodealliance/wasmtime/pull/11826/changes#diff-9a743b05b6a03d0ed59ce31ff3cb16d738a261a712f58748221ad8327da5ced8L341.
+        // But how do we map a compile-time offset to a runtime PC?
+        // As for the stuff in ELF_WASMTIME_EPOCH_CHECKS: the signal handler binary-searches through these (or maybe we'll load them into a hash table or something more clever). Or, could I just do something even more clever, smaller, and faster and just use the PC (grabbed out of ucontext_t.uc_mcontext.gregs) to index into the code segment and look for an artifact there. False positives, though. If we felt like blowing a bunch of RAM, we could allocate a piece of memory the size of the code section and put signposts in there, then just index into it. If x64 instructions are aligned and at least a certain length, we could compress it somewhat using the fact that the bottom, say, 3 bits are always 0.
+        // What's in siginfo and what's filled out for what signals: https://www.man7.org/linux/man-pages/man2/sigaction.2.html
+        //}
+
         // If no wasm code is executing, we don't handle this as a wasm
         // trap.
         let info = match info {
             Some(info) => info,
             None => return false,
         };
+
+        // Check for segfaults meant as cues to end an epoch.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if signum == libc::SIGSEGV && unsafe { (*siginfo).si_code } == SEGV_ACCERR {
+            // Compare it with the offsets of epoch-check instructions as stored
+            // in the object file.
+            let ucontext = unsafe { &*(context as *const libc::ucontext_t) };
+            let pc = ucontext.uc_mcontext.gregs[libc::REG_RIP as usize] as usize;
+
+            // Now things get expensive: we call lookup_code(), which takes a global lock.
+            if let Some((code_memory, offset_within_code)) = lookup_code(pc) {
+                // TODO: offset is probably one instruction too un-far. If so, tweak the emitter.
+                // We're within a 'target_arch = "x86_64"', so we can just treat
+                // the stored little-endians as native u32s.
+                if code_memory
+                    .epoch_checks()
+                    .binary_search(
+                        &(offset_within_code
+                            .try_into()
+                            .expect("epoch-check location should fit in 32 bits")),
+                    )
+                    .is_ok()
+                {
+                    // It is an epoch check. Jump to asm trampoline:
+
+                    return true;
+                }
+            } // Else it is an ordinary trap or the epochchecks section is somehow missing from the binary; continue on.
+        }
 
         // If we hit an exception while handling a previous trap, that's
         // quite bad, so bail out and let the system handle this

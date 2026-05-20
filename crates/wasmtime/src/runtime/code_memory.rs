@@ -33,6 +33,7 @@ pub struct CodeMemory {
     text: Range<usize>,
     unwind: Range<usize>,
     trap_data: Range<usize>,
+    epoch_check_data: Range<usize>,
     wasm_data: Range<usize>,
     address_map_data: Range<usize>,
     stack_map_data: Range<usize>,
@@ -127,6 +128,7 @@ impl CodeMemory {
         #[cfg(feature = "debug-builtins")]
         let mut has_native_debug_info = false;
         let mut trap_data = 0..0;
+        let mut epoch_check_data = 0..0;
         let mut exception_data = 0..0;
         let mut frame_tables_data = 0..0;
         let mut wasm_data = 0..0;
@@ -178,6 +180,7 @@ impl CodeMemory {
                 obj::ELF_WASMTIME_ADDRMAP => address_map_data = range,
                 obj::ELF_WASMTIME_STACK_MAP => stack_map_data = range,
                 obj::ELF_WASMTIME_TRAPS => trap_data = range,
+                obj::ELF_WASMTIME_EPOCH_CHECKS => epoch_check_data = range,
                 obj::ELF_WASMTIME_EXCEPTIONS => exception_data = range,
                 obj::ELF_WASMTIME_FRAMES => frame_tables_data = range,
                 obj::ELF_NAME_DATA => func_name_data = range,
@@ -222,6 +225,7 @@ impl CodeMemory {
             text,
             unwind,
             trap_data,
+            epoch_check_data,
             address_map_data,
             stack_map_data,
             exception_data,
@@ -305,6 +309,21 @@ impl CodeMemory {
     #[inline]
     pub fn trap_data(&self) -> &[u8] {
         &self.mmap[self.trap_data.clone()]
+    }
+
+    /// Returns the offsets from the beginning of the text section to the
+    /// epoch-ending load instructions. If this section is missing, as when not
+    /// using `--epoch-interruption-via-mmu`, returns an empty slice.
+    pub fn epoch_checks(&self) -> &[u32] {
+        // Offsets are aligned to 4 at emission time (required by
+        // from_raw_parts() and in any case good for speed).
+        let num_elements = (self.epoch_check_data.end - self.epoch_check_data.start) / 4;
+        unsafe {
+            std::slice::from_raw_parts(
+                self.mmap[self.epoch_check_data.to_owned()].as_ptr() as *const u32,
+                num_elements,
+            )
+        }
     }
 
     /// Publishes the internal ELF image to be ready for execution.
