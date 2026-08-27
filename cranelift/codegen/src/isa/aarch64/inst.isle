@@ -1015,11 +1015,8 @@
                        (end Reg)
                        (step Imm12))
 
-       ;; A load whose result is discarded, used to trigger MMU-based
-       ;; interruption. `context` is pinned to x0 and `dst` to x9 so that the
-       ;; signal handler knows where to find the former and where to puth the
-       ;; return address. See `dead_load_with_context` in the CLIF
-       ;; instruction set.
+       ;; A load whose result is discarded; `context` is pinned to x0 and `dst`
+       ;; to x9.
        (DeadLoadWithContext (dst WritableReg)
                             (load_ptr Reg)
                             (context Reg))))

@@ -322,9 +322,9 @@ fn compile_and_run_fails_on_unsupported_host(config: &mut Config) -> Result<()> 
         Ok(engine) => Module::new(&engine, "(module)")
             .expect_err("compile-and-run should fail on an unsupported host"),
     };
+    let err = format!("{err:?}");
     assert!(
-        err.to_string()
-            .contains("only supported on x86_64 and aarch64"),
+        err.contains("supported only on x86_64 and aarch64"),
         "unexpected error: {err}"
     );
     Ok(())

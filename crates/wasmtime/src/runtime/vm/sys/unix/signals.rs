@@ -251,18 +251,18 @@ unsafe extern "C" fn yield_current_fiber(
 /// 2MiB, of which only 512KiB is reserved for the Wasm stack, and (3) the fiber
 /// stack has a 4KiB guard page at the bottom, which causes
 /// `abort_stack_overflow()` to run if we do crash into it.
+///
+/// When control reaches here, we have just returned from a signal
+/// handler after rewriting PC to point to this trampoline but updating
+/// no other register state.
+///
+/// The stack has enough space for this state-saving, ensured by the
+/// stack-limit checks in Cranelift-compiled code.
 #[cfg(all(has_mmu_interruption, target_arch = "x86_64"))]
 #[unsafe(naked)]
 unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
     naked_asm!(
         "
-        // When control reaches here, we have just returned from a signal
-        // handler after rewriting PC to point to this trampoline but updating
-        // no other register state.
-        //
-        // The stack has enough space for this state-saving, ensured by the
-        // stack-limit checks in Cranelift-compiled code.
-
         // Push a fake return address just to keep the stack 16b-aligned for the
         // call, as SysV x64 demands.
         push 0
@@ -380,15 +380,8 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
 unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
     naked_asm!(
         "
-        // When control reaches here, we have just returned from a signal
-        // handler after rewriting PC to point to this trampoline but updating
-        // no other register state.
-        //
-        // The stack has enough space for this state-saving, ensured by the
-        // stack-limit checks in Cranelift-compiled code.
-
         // Establish an ordinary AAPCS64 frame record so stack walks can see
-        // through and set x29 as our frame pointer so it can be handed to
+        // through, and set x29 as our frame pointer so it can be handed to
         // `yield_current_fiber` as the trampoline FP.
         stp x29, x30, [sp, #-16]!
         mov x29, sp
@@ -424,8 +417,7 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         stp q28, q29, [sp, #592]
         stp q30, q31, [sp, #624]
 
-        // vmctx is already in x0, care of the signal handler
-        // `x0`` contains the vmctx.
+        // vmctx is already in x0, care of the signal handler.
         //
         // The following instructions prepare:
         // `x1` the value of `x9`, which is the scratch register with the return
@@ -491,9 +483,11 @@ fn ucontext_pc(ucontext: &libc::ucontext_t) -> usize {
     }
 }
 
-/// Arranges for the `ucontext` of an MMU-interrupt segfault to resume into
-/// `task_switch_trampoline` rather than retrying the faulting load, leaving
-/// `return_address` in the scratch register the trampoline expects it in.
+/// Arranges for the `ucontext` of an MMU-interrupt segfault to resume at
+/// `task_switch_trampoline` rather than at the original `return_address`.
+///
+/// Leaves the original `return_address` in the scratch register where the
+/// trampoline can find it.
 ///
 /// The vmctx is already in the first argument register, pinned there by
 /// `dead_load_with_context`, so the trampoline needs no help finding it.

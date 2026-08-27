@@ -3637,14 +3637,18 @@ impl MachInstEmit for Inst {
             &Inst::DeadLoadWithContext { dst, load_ptr, .. } => {
                 let start = sink.cur_offset();
 
-                // Reuse the `dst` address as the destination of the dead load,
-                // since we are clobbering it anyway.
-                sink.put4(enc_ldst_uimm12(
-                    0b1111100001,
-                    UImm12Scaled::zero(I64),
-                    load_ptr,
-                    dst.to_reg(),
-                ));
+                // Emit `ldr dst, [load_ptr]`. Reuse the `dst` address as the
+                // destination of the dead load, since we are clobbering it
+                // anyway.
+                Inst::ULoad64 {
+                    rd: dst,
+                    mem: AMode::UnsignedOffset {
+                        rn: load_ptr,
+                        uimm12: UImm12Scaled::zero(I64),
+                    },
+                    flags: MemFlagsData::trusted(),
+                }
+                .emit(sink, emit_info, state);
 
                 // Mark the address of this instruction as part of mmu
                 // interrupt.

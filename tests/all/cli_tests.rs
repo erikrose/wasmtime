@@ -195,7 +195,7 @@ fn run_wasmtime_mmu_interruption_unsupported_host() -> Result<()> {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("only supported on x86_64 and aarch64"),
+        stderr.contains("supported only on x86_64 and aarch64"),
         "unexpected stderr: {stderr}"
     );
     Ok(())
