@@ -244,7 +244,7 @@ unsafe extern "C" fn yield_current_fiber(
 /// straightforward call but by jimmying the ucontext to "resume into" this
 /// (instead of the trapping location) when the handler exits.
 ///
-/// This uses about 376b of stack space (on the normal stack, not the
+/// This uses about 344b of stack space (on the normal stack, not the
 /// sigaltstack) to save registers + a bit more to run `yield_current_fiber()`.
 /// In practice, this should not create uncaught stack overflows because (1)
 /// this trampoline runs only in async, (2) the default async_stack_size is
@@ -273,8 +273,10 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         // `VMStoreContext::wasm_exit_fp_from_trampoline_fp` expects.
         push rbp
 
-        // Save all GPRs except rbp/rsp (saved above and by normal stack
-        // discipline, respectively).
+        // Preserve caller-saved GPRs except rbp and rsp (saved above and by normal
+        // stack discipline, respectively). `yield_current_fiber()` and anything
+        // down that call chain will preserve the callee-saved ones (r12-r15 and
+        // rbx).
         push rdx
 
         // Now that rdx is pushed, take an intermission to put the original
@@ -283,7 +285,6 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
 
         // And do the rest of the GPRs.
         push rax
-        push rbx
         push rcx
         push rdi
         push rsi
@@ -291,17 +292,15 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         push r9
         push r10
         push r11
-        push r12
-        push r13
-        push r14
-        push r15
 
         // N.B.: we don't save rflags; Cranelift-compiled code
         // never assumes it is saved across instructions outside of
         // flag-generation / flag-consumption pairs, and the only
         // resumable traps we are interested in are not flags-related.
 
-        sub rsp, 256 // enough for all 16 XMM registers.
+        // 256 for the 16 XMM registers, plus 8 to make up for the misalignment
+        // of pushing an odd number of GPRs above:
+        sub rsp, 264
         movdqu [rsp +  0 * 16], xmm0
         movdqu [rsp +  1 * 16], xmm1
         movdqu [rsp +  2 * 16], xmm2
@@ -342,12 +341,8 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         movdqu xmm13, [rsp + 13 * 16]
         movdqu xmm14, [rsp + 14 * 16]
         movdqu xmm15, [rsp + 15 * 16]
-        add rsp, 256
+        add rsp, 264
 
-        pop r15
-        pop r14
-        pop r13
-        pop r12
         pop r11
         pop r10
         pop r9
@@ -355,7 +350,6 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         pop rsi
         pop rdi
         pop rcx
-        pop rbx
         pop rax
         pop rdx
 
