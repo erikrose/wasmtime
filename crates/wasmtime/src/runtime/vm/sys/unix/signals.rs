@@ -171,7 +171,7 @@ unsafe extern "C" fn yield_current_fiber(
     vmctx: NonNull<VMContext>,
     wasm_resume_pc: usize,
     trampoline_fp: usize,
-) {
+) -> *const () {
     unsafe {
         // is_cancelled means an error occurred and unwind info has been stored
         // in TLS.
@@ -226,6 +226,9 @@ unsafe extern "C" fn yield_current_fiber(
             });
         }
     }
+    todo!(
+        "Fetch and return an unprotected page from the timer wheel, once it exists. Write it to VMStoreContext, too."
+    )
 }
 
 /// Switches tasks in response to a signal thrown under MMU-based epoch
@@ -238,7 +241,8 @@ unsafe extern "C" fn yield_current_fiber(
 /// signal handler in the scratch register that `dead_load_with_context`
 /// reserves: r10 on x64, x9 on aarch64. The signal handler has also left the
 /// address of the vmctx in the first argument register (rdi on x64, x0 on
-/// aarch64), where `dead_load_with_context` pinned it.
+/// aarch64), where `dead_load_with_context` pinned it. Finally, this returns
+/// the next interrupt page ptr to use (in r11 for x64, x10 for aarch64).
 ///
 /// # Safety
 ///
@@ -247,7 +251,7 @@ unsafe extern "C" fn yield_current_fiber(
 /// straightforward call but by jimmying the ucontext to "resume into" this
 /// (instead of the trapping location) when the handler exits.
 ///
-/// This uses about 344b of stack space (on the normal stack, not the
+/// This uses about 328b of stack space (on the normal stack, not the
 /// sigaltstack) to save registers + a bit more to run `yield_current_fiber()`.
 /// In practice, this should not create uncaught stack overflows because (1)
 /// this trampoline runs only in async, (2) the default async_stack_size is
@@ -276,10 +280,14 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         // `VMStoreContext::wasm_exit_fp_from_trampoline_fp` expects.
         push rbp
 
-        // Preserve caller-saved GPRs except rbp and rsp (saved above and by normal
-        // stack discipline, respectively). `yield_current_fiber()` and anything
-        // down that call chain will preserve the callee-saved ones (r12-r15 and
-        // rbx).
+        // Preserve caller-saved GPRs except rbp and rsp (saved above and by
+        // normal stack discipline, respectively). The interrupt location
+        // doesn't know anything is being 'called', so we have to do the saving
+        // ourselves. `yield_current_fiber()` and anything down that call chain
+        // preserve the callee-saved registers (r12-r15 and rbx).
+        //
+        // We don't have to save r11 because `dead_load_with_context` defs it.
+
         push rdx
 
         // Now that rdx is pushed, take an intermission to put the original
@@ -294,16 +302,15 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         push r8
         push r9
         push r10
-        push r11
 
         // N.B.: we don't save rflags; Cranelift-compiled code
         // never assumes it is saved across instructions outside of
         // flag-generation / flag-consumption pairs, and the only
         // resumable traps we are interested in are not flags-related.
 
-        // 256 for the 16 XMM registers, plus 8 to make up for the misalignment
-        // of pushing an odd number of GPRs above:
-        sub rsp, 264
+        // 256 for the 16 XMM registers. No padding is needed: an even number
+        // of GPRs was pushed above, so the stack is already 16b-aligned.
+        sub rsp, 256
         movdqu [rsp +  0 * 16], xmm0
         movdqu [rsp +  1 * 16], xmm1
         movdqu [rsp +  2 * 16], xmm2
@@ -326,6 +333,10 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         mov rsi, r10
         // ...and call yield_current_fiber() to do the task switch.
         call {}
+        // Move return value (the new MMU interrupt page ptr) to r11 to be
+        // returned by the dead_load_with_context instruction, which we're in
+        // the middle of.
+        mov r11, rax
 
         // Restore registers.
         movdqu xmm0,  [rsp +  0 * 16]
@@ -344,9 +355,8 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         movdqu xmm13, [rsp + 13 * 16]
         movdqu xmm14, [rsp + 14 * 16]
         movdqu xmm15, [rsp + 15 * 16]
-        add rsp, 264
+        add rsp, 256
 
-        pop r11
         pop r10
         pop r9
         pop r8
@@ -392,7 +402,12 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         stp x4, x5, [sp, #32]
         stp x6, x7, [sp, #48]
         stp x8, x9, [sp, #64]
-        stp x10, x11, [sp, #80]
+        // We don't save x10 because `dead_load_with_context` defs it; we fill
+        // it below with the next interrupt page pointer. We leave an 8-byte
+        // hole here because the stp instructions below that store the q
+        // registers need their offsets to be 16-byte aligned, and this is as
+        // good a place as any for the padding.
+        str x11, [sp, #88]
         stp x12, x13, [sp, #96]
         stp x14, x15, [sp, #112]
         stp x16, x17, [sp, #128]
@@ -424,6 +439,10 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         mov x2, x29
         // Call yield_current_fiber() to do the task switch.
         bl {}
+        // Move return value (the new MMU interrupt page ptr) to x10 to be
+        // returned by the dead_load_with_context instruction, which we're in
+        // the middle of.
+        mov x10, x0
 
         // Restore registers.
         ldp q0, q1, [sp, #144]
@@ -448,7 +467,7 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         ldp x4, x5, [sp, #32]
         ldp x6, x7, [sp, #48]
         ldp x8, x9, [sp, #64]
-        ldp x10, x11, [sp, #80]
+        ldr x11, [sp, #88]
         ldp x12, x13, [sp, #96]
         ldp x14, x15, [sp, #112]
         ldp x16, x17, [sp, #128]

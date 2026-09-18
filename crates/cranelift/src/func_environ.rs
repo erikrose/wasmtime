@@ -743,9 +743,15 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         builder: &mut FunctionBuilder<'_>,
     ) {
         let vmctx = self.vmctx_val(&mut builder.cursor());
-        let _ = builder
-            .ins()
-            .dead_load_with_context(mmu_interrupt_page_ptr, vmctx, TRAP_MMU_INTERRUPT);
+        let next_page_ptr =
+            builder
+                .ins()
+                .dead_load_with_context(mmu_interrupt_page_ptr, vmctx, TRAP_MMU_INTERRUPT);
+        // If the signal handler returned a new page ptr, update our cache var
+        // with it. This var most likely lives in a register and, if it's the
+        // one dead_load_with_context pins its first operand to (which regalloc
+        // may endeavor to arrange), no move need actually occur here.
+        builder.def_var(self.mmu_interrupt_page_ptr_var, next_page_ptr);
     }
 
     #[cfg(feature = "wmemcheck")]

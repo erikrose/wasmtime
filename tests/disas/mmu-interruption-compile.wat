@@ -11,8 +11,8 @@
 ;;       pushq   %rbp
 ;;       movq    %rsp, %rbp
 ;;       movq    8(%rdi), %rsi
-;;       movq    0x10(%rsi), %rsi
-;;       movq    (%rsi), %r10
+;;       movq    0x10(%rsi), %r11
+;;       movq    (%r11), %r10
 ;;       ╰─╼ trap: MmuInterrupt
 ;;       movq    %rbp, %rsp
 ;;       popq    %rbp

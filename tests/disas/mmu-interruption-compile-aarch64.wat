@@ -10,10 +10,10 @@
 ;; wasm[0]::function[0]:
 ;;       stp     x29, x30, [sp, #-0x10]!
 ;;       mov     x29, sp
-;;       ldr     x4, [x2, #8]
-;;       ldr     x4, [x4, #0x10]
+;;       ldr     x5, [x2, #8]
+;;       ldr     x10, [x5, #0x10]
 ;;       mov     x0, x2
-;;       ldr     x9, [x4]
+;;       ldr     x9, [x10]
 ;;       ╰─╼ trap: MmuInterrupt
 ;;       ldp     x29, x30, [sp], #0x10
 ;;       ret

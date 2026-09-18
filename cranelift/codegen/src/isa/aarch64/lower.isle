@@ -2442,16 +2442,17 @@
 
 ;;;; Rules for `dead_load_with_context` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(rule (lower (dead_load_with_context load_ptr context trap_code))
+(rule (lower (dead_load_with_context _ load_ptr context trap_code))
       (let ((load_ptr Reg (put_in_reg load_ptr))
             (context Reg (put_in_reg context))
             (dst WritableReg (temp_writable_reg $I64))
-            (_ Unit (emit_side_effect (SideEffectNoResult.Inst
-                  (MInst.DeadLoadWithContext dst
-                                             load_ptr
-                                             context
-                                             trap_code)))))
-       (output_none)))
+            (next_load_ptr WritableReg (temp_writable_reg $I64))
+            (_ Unit (emit (MInst.DeadLoadWithContext dst
+                                                     load_ptr
+                                                     context
+                                                     trap_code
+                                                     next_load_ptr))))
+       (output_reg next_load_ptr)))
 
 ;;; Rules for `get_{frame,stack}_pointer` and `get_return_address` ;;;;;;;;;;;;;
 
