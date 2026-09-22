@@ -147,22 +147,28 @@ now.
     }
 }
 
-/// Causes the active fiber to yield.
+/// Causes the active fiber to yield in response to an MMU interruption. If, on
+/// deeper examination, the interruption is shown to be the result of a stale
+/// interrupt-page-ptr cache, the yield is skipped so the fiber can receive its
+/// due full timeslice.
 ///
-/// Consequently, this returns only after this fiber resumes, appearing to be a
-/// normal synchronous function from the standpoint of the caller.
+/// If it does yield, this function returns only after the fiber resumes,
+/// appearing to be a normal synchronous function from the standpoint of the
+/// caller.
 ///
 /// Returns the address of the interrupt page that should cause this fiber's
 /// next interruption. In a scheduling scheme which sets up a relationship
 /// between time and pages, the return value effectively chooses the next time
-/// at which it is interrupted.
+/// at which it is interrupted. In the case of a stale cache, the return value
+/// brings the cache up to date.
 ///
 /// `wasm_resume_pc` is the address of the load that triggered the signal; it is
 /// re-executed on resume. `trampoline_fp` is a pointer to
 /// `task_switch_trampoline`'s frame, which points at the slot where it saved
 /// the Wasm caller's frame pointer. Providing these allows this to ape the
 /// behavior of the wasm-to-host trampoline so backtrace capture works in the
-/// case of fiber cancellation.
+/// case of fiber cancellation. `load_ptr` is the memory address the interrupt
+/// check loaded from and segfaulted on.
 ///
 /// If this fiber gets cancelled within the duration of our yield, this function
 /// never returns, instead initiating an unwind.
@@ -171,12 +177,13 @@ now.
 ///
 /// `vmctx` must be a currently-entered `VMContext`. In current use,
 /// `task_switch_trampoline` ensures the first argument register still holds the
-/// Wasm caller's vmctx and sets up the other two argument registers as well.
+/// Wasm caller's vmctx and sets up the other argument registers as well.
 #[cfg(has_mmu_interruption)]
-unsafe extern "C" fn yield_current_fiber(
+unsafe extern "C" fn maybe_yield_fiber(
     vmctx: NonNull<VMContext>,
     wasm_resume_pc: usize,
     trampoline_fp: usize,
+    load_ptr: VmPtr<libc::c_void>,
 ) -> VmPtr<libc::c_void> {
     let mut next_interrupt_page: Option<VmPtr<libc::c_void>> = None;
     unsafe {
@@ -190,17 +197,41 @@ unsafe extern "C" fn yield_current_fiber(
                 store.can_block(),
                 "mmu-interruption should automatically enable asyncness on all stores referencing the engine on which it's configured, but somehow asyncness was off"
             );
+            let store_ctx = store.vm_store_context();
+
+            // Check the ptr we loaded through that caused the interruption
+            // fault. Ideally, it is the same as the one stored in the
+            // VMStoreContext, meaning the active Wasm function's local
+            // interrupt-page-ptr cache was up to date and we can proceed with
+            // switching fibers, care of the code below. However, we have
+            // elected to avoid doing an unconditional store to the cache after
+            // every interruption check, and so sometimes it is stale. This
+            // shows up as the 2 ptrs being different. In this case, we dodge
+            // what would be an erroneous yield and return the up-to-date ptr to
+            // refresh the cache. In a call tree like A() → B() → C() → D(),
+            // where D interrupts, we can expect one of these cache-refreshing
+            // bogus interruptions for each Wasm stack frame above it: so, A, B,
+            // and C, assuming each of them has any remaining interruption
+            // checks to hit. Without this cache-refreshing facility, those 3
+            // functions would continue to throw interrupts at every checkpoint
+            // until they return. See more about the cache at
+            // `FuncEnvironment.mmu_interrupt_page_ptr_var`.
+            if let Some(true_ptr) = store_ctx.mmu_interrupt_page_ptr
+                && true_ptr != load_ptr
+            {
+                next_interrupt_page = Some(true_ptr);
+                return Ok(());
+            }
 
             // Record Wasm-exit state just as a Cranelift-emitted wasm-to-host
             // trampoline would so that any backtrace capture triggered
             // while we are in the host (in particular, on the cancellation
             // path below) sees a coherent topmost Wasm activation. Otherwise,
             // it hits a debug assert and crashes.
-            let store_ctx = store.vm_store_context();
             *store_ctx.last_wasm_exit_pc.get() = wasm_resume_pc;
             *store_ctx.last_wasm_exit_trampoline_fp.get() = trampoline_fp;
 
-            // And actually switch fibers. (This runs no wasm.)
+            // Actually switch fibers. (No Wasm runs during this yield.)
             //
             // `block_on()` documents that the store may not be used and no
             // other fiber resumed until this one is. Thus, the store is
@@ -218,8 +249,7 @@ unsafe extern "C" fn yield_current_fiber(
                 *store_ctx.last_wasm_exit_pc.get() = 0;
                 *store_ctx.last_wasm_exit_trampoline_fp.get() = 0;
 
-                // Get the address of the new interrupt page, whose acquisition
-                // was effected by the fiber yield above.
+                // Get the address of the latest interrupt page.
                 next_interrupt_page = store_ctx.mmu_interrupt_page_ptr;
             }
             // Else leave exit state in place so `record_unwind` (called via
@@ -253,13 +283,14 @@ unsafe extern "C" fn yield_current_fiber(
 ///
 /// Saves register state, makes a host call to switch tasks, restores state, and
 /// jumps back to the load instruction that triggered the signal, re-executing
-/// it. (The interrupt page has been unprotected by then, so the retry
-/// succeeds.) The address of that instruction has been squirreled away by the
-/// signal handler in the scratch register that `dead_load_with_context`
-/// reserves: r10 on x64, x9 on aarch64. The signal handler has also left the
-/// address of the vmctx in the first argument register (rdi on x64, x0 on
-/// aarch64), where `dead_load_with_context` pinned it. Finally, this returns
-/// the next interrupt page ptr to use (in r11 for x64, x10 for aarch64).
+/// it. (The interrupt page has been replaced with an unprotected one by then,
+/// so the retry succeeds.) The address of that load instruction has been
+/// squirreled away by the signal handler in the scratch register that
+/// `dead_load_with_context` reserves: r10 on x64, x9 on aarch64. The signal
+/// handler has also left the address of the vmctx in the first argument
+/// register (rdi on x64, x0 on aarch64), where `dead_load_with_context` pinned
+/// it. Finally, this returns the next interrupt page ptr to use (in r11 for
+/// x64, x10 for aarch64).
 ///
 /// # Safety
 ///
@@ -269,19 +300,19 @@ unsafe extern "C" fn yield_current_fiber(
 /// (instead of the trapping location) when the handler exits.
 ///
 /// This uses about 328b of stack space (on the normal stack, not the
-/// sigaltstack) to save registers + a bit more to run `yield_current_fiber()`.
-/// In practice, this should not create uncaught stack overflows because (1)
-/// this trampoline runs only in async, (2) the default async_stack_size is
-/// 2MiB, of which only 512KiB is reserved for the Wasm stack, and (3) the fiber
-/// stack has a 4KiB guard page at the bottom, which causes
-/// `abort_stack_overflow()` to run if we do crash into it.
+/// sigaltstack) to save registers + a bit more to run `maybe_yield_fiber()`. In
+/// practice, this should not create uncaught stack overflows because (1) this
+/// trampoline runs only in async, (2) the default async_stack_size is 2MiB, of
+/// which only 512KiB is reserved for the Wasm stack, and (3) the fiber stack
+/// has a 4KiB guard page at the bottom, which causes `abort_stack_overflow()`
+/// to run if we do crash into it.
 ///
-/// When control reaches here, we have just returned from a signal
-/// handler after rewriting PC to point to this trampoline but updating
-/// no other register state.
+/// When control reaches here, we have just returned from a signal handler after
+/// rewriting PC to point to this trampoline but updating no other register
+/// state.
 ///
-/// The stack has enough space for this state-saving, ensured by the
-/// stack-limit checks in Cranelift-compiled code.
+/// The stack has enough space for this state-saving, ensured by the stack-limit
+/// checks in Cranelift-compiled code.
 #[cfg(all(has_mmu_interruption, target_arch = "x86_64"))]
 #[unsafe(naked)]
 unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
@@ -292,7 +323,7 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         push 0
         // This is an ordinary frame as seen by stack-walks. We also establish
         // rbp as our frame pointer so that we can hand it to
-        // `yield_current_fiber` as the trampoline FP: the saved wasm rbp lives
+        // `maybe_yield_fiber` as the trampoline FP: the saved wasm rbp lives
         // at [rbp], which is exactly what
         // `VMStoreContext::wasm_exit_fp_from_trampoline_fp` expects.
         push rbp
@@ -300,7 +331,7 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         // Preserve caller-saved GPRs except rbp and rsp (saved above and by
         // normal stack discipline, respectively). The interrupt location
         // doesn't know anything is being 'called', so we have to do the saving
-        // ourselves. `yield_current_fiber()` and anything down that call chain
+        // ourselves. `maybe_yield_fiber()` and anything down that call chain
         // preserve the callee-saved registers (r12-r15 and rbx).
         //
         // We don't have to save r11 because `dead_load_with_context` defs it.
@@ -308,7 +339,7 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         push rdx
 
         // Now that rdx is pushed, take an intermission to put the original
-        // value of rbp into it, for use as arg 3 to yield_current_fiber().
+        // value of rbp into it, for use as arg 3 to maybe_yield_fiber().
         lea rdx, [rsp + 8]
 
         // And do the rest of the GPRs.
@@ -346,9 +377,13 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         movdqu [rsp + 15 * 16], xmm15
 
         // vmctx is already in rdi, care of the signal handler. Get the 2nd
-        // arg ready (the 3rd already having been put in rdx above)...
+        // (`wasm_resume_pc`) arg ready, the 3rd (`trampoline_fp`) already
+        // having been put in rdx above...
         mov rsi, r10
-        // ...and call yield_current_fiber() to do the task switch.
+        // Ready the 4th (`load_ptr`) arg, which is already in r11, having been
+        // pinned there by `dead_load_with_context`.
+        mov rcx, r11
+        // ...and call maybe_yield_fiber() to do the task switch.
         call {}
         // Move return value (the new MMU interrupt page ptr) to r11 to be
         // returned by the dead_load_with_context instruction, which we're in
@@ -391,7 +426,7 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         // re-executing it.
         jmp r10
         ",
-        sym yield_current_fiber
+        sym maybe_yield_fiber
     );
 }
 
@@ -406,7 +441,7 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         "
         // Establish an ordinary AAPCS64 frame record so stack walks can see
         // through, and set x29 as our frame pointer so it can be handed to
-        // `yield_current_fiber` as the trampoline FP.
+        // `maybe_yield_fiber` as the trampoline FP.
         stp x29, x30, [sp, #-16]!
         mov x29, sp
 
@@ -449,12 +484,14 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         // vmctx is already in x0, care of the signal handler.
         //
         // The following instructions prepare:
-        // `x1` the value of `x9`, which is the scratch register with the return
-        // address.
-        // `x2` the value of `x29`, which is the frame pointer.
+        // `x1`: the value of `x9`, which is the scratch register with the return
+        // address
+        // `x2`: the value of `x29`, which is the frame pointer
+        // `x3`: `load_ptr`, pinned by `dead_load_with_context` to x10
         mov x1, x9
         mov x2, x29
-        // Call yield_current_fiber() to do the task switch.
+        mov x3, x10
+        // Call maybe_yield_fiber() to do the task switch.
         bl {}
         // Move return value (the new MMU interrupt page ptr) to x10 to be
         // returned by the dead_load_with_context instruction, which we're in
@@ -497,7 +534,7 @@ unsafe extern "C" fn task_switch_trampoline(_vmctx: usize) {
         // return address.
         br x9
         ",
-        sym yield_current_fiber
+        sym maybe_yield_fiber
     );
 }
 
