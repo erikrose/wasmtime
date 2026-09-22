@@ -1113,7 +1113,7 @@ pub struct VMStoreContext {
     /// When it is time to switch, the host uses mprotect() to forbid reads. The
     /// fault soon caused by guest code then lands in the signal handler, which
     /// effects a switch and resets the page permissions.
-    mmu_interrupt_page_ptr: Option<VmPtr<c_void>>, // ptr-sized
+    pub(crate) mmu_interrupt_page_ptr: Option<VmPtr<c_void>>, // ptr-sized
 
     /// The "store version".
     ///
@@ -1387,23 +1387,6 @@ impl VMStoreContext {
             Some(non_null_page_ptr.into())
         };
         ret
-    }
-
-    /// Iff MMU interruption is on, returns an object from which we can
-    /// perform an interrupt (that is, protect the interrupt page).
-    ///
-    /// `running` is the store's "a fiber of this store is currently resumed"
-    /// flag, maintained by `StoreOpaque`; see
-    /// [`MmuInterrupter::is_running()`].
-    pub fn mmu_interrupter(&self, fibers_on_stack: Arc<AtomicUsize>) -> Option<MmuInterrupter> {
-        if self.mmu_interrupt_page_ptr.is_some() {
-            Some(MmuInterrupter {
-                vm_store_context: crate::runtime::vm::SendSyncPtr::new(NonNull::from(self)),
-                fibers_on_stack,
-            })
-        } else {
-            None
-        }
     }
 
     /// Sets the MMU access control bits to prevent read access. The public road
