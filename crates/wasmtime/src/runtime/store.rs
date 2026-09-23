@@ -437,7 +437,7 @@ impl<T> DerefMut for StoreInner<T> {
 
 /// A reference to an MMU interrupt page. It is intended that an
 /// `MmuInterrupter` may need squirrel away opaque data herein.
-pub trait PageHandle {
+pub trait PageHandle: Send + Sync {
     /// Returns the interrupt page pointer: the memory address to attempt to
     /// load at checkpoints.
     fn page_ptr(&self) -> VmPtr<c_void>;
@@ -453,7 +453,7 @@ pub trait MmuInterrupter: Send + Sync {
     /// interrupt if it becomes unreadable. It is a logic error to release a
     /// page and not immediately acquire a new one when the corresponding store
     /// has any fibers in the Executing state.
-    fn release_page(&self, page: &dyn PageHandle);
+    fn release_page(&self, page: Box<dyn PageHandle>);
 }
 
 /// Monomorphic storage for a `Store<T>`.
@@ -2161,18 +2161,14 @@ impl StoreOpaque {
     /// this store may run forever without interruption.
     #[cfg(has_mmu_interruption)]
     pub(crate) fn release_interrupt_page(&mut self) {
-        match &self.mmu_interrupt_page_handle {
-            None => {
-                panic!("attempted to detach an interrupt page from a store, but none was attached")
-            }
-            Some(handle) => {
-                // See comment in `acquire_interrupt_page()` establishing the
-                // lack of races here.
-                self.vm_store_context.mmu_interrupt_page_ptr.take();
-                self.mmu_interrupter.release_page(handle);
-                self.mmu_interrupt_page_handle = None;
-            }
-        }
+        // See comment in `acquire_interrupt_page()` establishing the
+        // lack of races here.
+        let handle = self
+            .mmu_interrupt_page_handle
+            .take()
+            .expect("attempted to detach an interrupt page from a store, but none was attached");
+        self.mmu_interrupter.release_page(handle);
+        self.vm_store_context.mmu_interrupt_page_ptr = None;
     }
 
     /// Increments the count of fibers currently stacked up to run on this
