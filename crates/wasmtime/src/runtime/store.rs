@@ -786,21 +786,10 @@ impl<T> Store<T> {
         log::trace!("creating new store {:?}", store_data.id());
 
         let pkey = engine.allocator().next_available_pkey();
-
-        #[cfg(has_mmu_interruption)]
-        let vm_store_context = if engine.tunables().mmu_interruption {
-            VMStoreContext::with_interrupt_page()
-        } else {
-            VMStoreContext::default()
-        };
-
-        #[cfg(not(has_mmu_interruption))]
-        let vm_store_context = VMStoreContext::default();
-
         let inner = StoreOpaque {
             _marker: marker::PhantomPinned,
             engine: engine.clone(),
-            vm_store_context,
+            vm_store_context: VMStoreContext::default(),
             #[cfg(feature = "stack-switching")]
             continuations: Vec::new(),
             instances: TryPrimaryMap::new(),
