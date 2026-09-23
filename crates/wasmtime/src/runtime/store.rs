@@ -597,14 +597,16 @@ pub struct StoreOpaque {
 
     /// The number of fibers currently executing on this Store, including ones
     /// further down in the call stack which, directly or indirectly, caused the
-    /// current one to run
+    /// current one to run. Defined only if the `mmu_interruption` Engine
+    /// tunable is on.
     #[cfg(has_mmu_interruption)]
     fibers_on_stack: usize,
 
     /// The functions through which this store attaches and detaches itself from
-    /// interrupt pages under MMU interruption
+    /// interrupt pages under MMU interruption. None if the `mmu_interruption`
+    /// Engine tunable is off.
     #[cfg(has_mmu_interruption)]
-    mmu_interrupter: Arc<dyn MmuInterrupter>,
+    mmu_interrupter: Option<Arc<dyn MmuInterrupter>>,
 
     /// Partly opaque token that lets us get our interrupt page ptr or detach
     /// ourselves from it
@@ -2132,9 +2134,15 @@ impl StoreOpaque {
     /// controls interruption scheduling.
     ///
     /// Panics if a page is already assigned to this store. Otherwise, we'd risk
-    /// leaking one.
+    /// leaking one. Also panics if the `mmu_interruption` Engine tunable is
+    /// off; without the instructions compiled in which load from the page,
+    /// there's no sense attaching one to the store.
     #[cfg(has_mmu_interruption)]
     pub(crate) fn acquire_interrupt_page(&mut self) {
+        assert!(
+            self.engine.tunables().mmu_interruption,
+            "To call acquire_inerrupt_page(), the mmu_interruption must be enabled in the Engine."
+        );
         match &self.mmu_interrupt_page_handle {
             Some(_) => panic!(
                 "attempted to attach an interrupt page to a store when one was already attached"
@@ -2147,7 +2155,7 @@ impl StoreOpaque {
                 // the order of the following several lines; the JITted code
                 // isn't reading the page ptr, and it isn't firing off the
                 // signal handler that does so (via trampoline) either.
-                let new_page = self.mmu_interrupter.acquire_page();
+                let new_page = self.mmu_interrupter().acquire_page();
                 self.vm_store_context.mmu_interrupt_page_ptr = Some(new_page.page_ptr());
                 self.mmu_interrupt_page_handle = Some(new_page);
             }
@@ -2167,15 +2175,20 @@ impl StoreOpaque {
             .mmu_interrupt_page_handle
             .take()
             .expect("attempted to detach an interrupt page from a store, but none was attached");
-        self.mmu_interrupter.release_page(handle);
+        self.mmu_interrupter().release_page(handle);
         self.vm_store_context.mmu_interrupt_page_ptr = None;
     }
 
     /// Increments the count of fibers currently stacked up to run on this
     /// store. If it goes from 0 to >0, it attaches this store to a readable
-    /// interrupt page, as that means it is running.
+    /// interrupt page, as that means it is running. Does nothing unless
+    /// `mmu_interruption` tunable is enabled in the Engine.
     #[cfg(has_mmu_interruption)]
     pub(crate) fn increment_fibers(&mut self) {
+        if !self.engine.tunables().mmu_interruption {
+            return;
+        }
+
         // There's no way wrapping should happen if stack frames are
         // non-zero in size. You'd run out of addressible memory first.
         debug_assert!(
@@ -2193,9 +2206,13 @@ impl StoreOpaque {
     /// Decrements the count of fibers currently stacked up to run on this
     /// store. If it reaches 0, detaches the store from its interrupt page,
     /// since we don't want it to be interrupted if it's not running, lest it
-    /// yield its timeslice almost immediately after it runs again.
+    /// yield its timeslice almost immediately after it runs again. Does nothing
+    /// unless `mmu_interruption` tunable is enabled in the Engine.
     #[cfg(has_mmu_interruption)]
     pub(crate) fn decrement_fibers(&mut self) {
+        if !self.engine.tunables().mmu_interruption {
+            return;
+        }
         debug_assert!(
             self.fibers_on_stack > 0,
             "The fibers-on-stack count for a Store was about to go negative."
@@ -2204,6 +2221,14 @@ impl StoreOpaque {
         if self.fibers_on_stack == 0 {
             self.release_interrupt_page();
         }
+    }
+
+    /// Return the MMU interrupter assigned to this Store, panicking if none is.
+    #[cfg(has_mmu_interruption)]
+    fn mmu_interrupter(&self) -> &dyn MmuInterrupter {
+        self.mmu_interrupter
+            .as_deref()
+            .expect("MMU interrupter should be set on store")
     }
 
     #[inline]
