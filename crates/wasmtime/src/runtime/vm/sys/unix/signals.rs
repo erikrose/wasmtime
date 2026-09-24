@@ -5,6 +5,7 @@ use crate::prelude::*;
 use crate::runtime;
 #[cfg(has_mmu_interruption)]
 use crate::runtime::module::lookup_code;
+#[cfg(has_mmu_interruption)]
 use crate::runtime::vm::VmPtr;
 #[cfg(has_mmu_interruption)]
 use crate::runtime::vm::traphandlers::raise_preexisting_trap;

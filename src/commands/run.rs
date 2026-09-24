@@ -77,6 +77,12 @@ pub struct RunCommand {
     #[arg(skip)]
     pub module_bytes: Option<&'static [u8]>,
 
+    /// The MMU interrupter given to the engine, kept so it can be started and
+    /// stopped
+    #[cfg(has_mmu_interruption)]
+    #[arg(skip)]
+    pub(crate) timer_wheel: Option<std::sync::Arc<wasmtime::TimerWheelInterrupter>>,
+
     /// The WebAssembly module to run and arguments to pass to it.
     ///
     /// Arguments passed to the wasm module will be configured as WASI CLI
@@ -355,6 +361,17 @@ impl RunCommand {
             None => {}
         }
 
+        #[cfg(has_mmu_interruption)]
+        if wasm_options.mmu_interruption == Some(true) {
+            let mut wheel = wasmtime::TimerWheelInterrupter::new();
+            if let Some(timeout) = wasm_options.timeout {
+                wheel = wheel.with_timeslice(timeout).with_resolution(timeout);
+            }
+            let wheel = std::sync::Arc::new(wheel);
+            config.with_mmu_interrupter(wheel.clone());
+            self.timer_wheel = Some(wheel);
+        }
+
         Engine::new(&config)
     }
 
@@ -494,6 +511,11 @@ impl RunCommand {
         })
         .await;
 
+        #[cfg(has_mmu_interruption)]
+        if let Some(wheel) = &self.timer_wheel {
+            wheel.stop();
+        }
+
         // Load the main wasm module.
         let instance = match result.unwrap_or_else(|elapsed| {
             Err(wasmtime::Error::from(wasmtime::Trap::Interrupt))
@@ -588,20 +610,18 @@ impl RunCommand {
             }
 
             if let Some(timeout) = self.run.common.wasm.timeout {
-                store.set_epoch_deadline(1);
-                let engine = store.engine().clone();
-                // Store isn't Send, so we can't move it to the thread.
+                if store.engine().get_epoch_interruption() {
+                    store.set_epoch_deadline(1);
+                    let engine = store.engine().clone();
+                    thread::spawn(move || {
+                        thread::sleep(timeout);
+                        engine.increment_epoch();
+                    });
+                }
                 #[cfg(has_mmu_interruption)]
-                let mmu_interrupter = store.mmu_interrupter();
-                thread::spawn(move || {
-                    thread::sleep(timeout);
-                    #[cfg(has_mmu_interruption)]
-                    if let Some(interrupter) = mmu_interrupter {
-                        interrupter.interrupt();
-                        return;
-                    }
-                    engine.increment_epoch();
-                });
+                if let Some(wheel) = &self.timer_wheel {
+                    wheel.start();
+                }
             }
         }
 
