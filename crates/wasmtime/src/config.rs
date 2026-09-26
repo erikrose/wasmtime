@@ -816,8 +816,8 @@ impl Config {
     /// yield. The [`Engine`] owns a single interrupter, shared by all its
     /// stores. You must provide this interrupter using
     /// [`Config::with_mmu_interrupter`] before running code.
-    /// [`TimerWheelInterruper`](crate::TimerWheelInterruper) is one; like the
-    /// epoch counter, it does nothing until you start it.
+    /// [`TimingWheelInterrupter`](crate::TimingWheelInterrupter) is one; like the
+    /// epoch counter, it does nothing until you tick it.
     ///
     /// # Requirements
     ///

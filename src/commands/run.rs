@@ -81,7 +81,7 @@ pub struct RunCommand {
     /// stopped
     #[cfg(has_mmu_interruption)]
     #[arg(skip)]
-    pub(crate) timer_wheel: Option<std::sync::Arc<wasmtime::TimerWheelInterrupter>>,
+    pub(crate) timing_wheel: Option<std::sync::Arc<wasmtime::TimingWheelInterrupter>>,
 
     /// The WebAssembly module to run and arguments to pass to it.
     ///
@@ -363,13 +363,9 @@ impl RunCommand {
 
         #[cfg(has_mmu_interruption)]
         if wasm_options.mmu_interruption == Some(true) {
-            let mut wheel = wasmtime::TimerWheelInterrupter::new();
-            if let Some(timeout) = wasm_options.timeout {
-                wheel = wheel.with_timeslice(timeout).with_resolution(timeout);
-            }
-            let wheel = std::sync::Arc::new(wheel);
+            let wheel = std::sync::Arc::new(wasmtime::TimingWheelInterrupter::new(1));
             config.with_mmu_interrupter(wheel.clone());
-            self.timer_wheel = Some(wheel);
+            self.timing_wheel = Some(wheel);
         }
 
         Engine::new(&config)
@@ -511,11 +507,6 @@ impl RunCommand {
         })
         .await;
 
-        #[cfg(has_mmu_interruption)]
-        if let Some(wheel) = &self.timer_wheel {
-            wheel.stop();
-        }
-
         // Load the main wasm module.
         let instance = match result.unwrap_or_else(|elapsed| {
             Err(wasmtime::Error::from(wasmtime::Trap::Interrupt))
@@ -619,8 +610,14 @@ impl RunCommand {
                     });
                 }
                 #[cfg(has_mmu_interruption)]
-                if let Some(wheel) = &self.timer_wheel {
-                    wheel.start();
+                if let Some(wheel) = self.timing_wheel.clone() {
+                    // Unlike an epoch increment, a tick doesn't stick, so keep ticking.
+                    thread::spawn(move || {
+                        loop {
+                            thread::sleep(timeout);
+                            wheel.tick();
+                        }
+                    });
                 }
             }
         }

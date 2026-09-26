@@ -92,7 +92,7 @@ impl WizerCommand {
             preloads: self.preloads.clone(),
             module_bytes: None,
             #[cfg(has_mmu_interruption)]
-            timer_wheel: None,
+            timing_wheel: None,
         };
         let engine = run.new_engine()?;
 

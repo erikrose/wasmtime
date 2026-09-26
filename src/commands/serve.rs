@@ -579,18 +579,22 @@ impl ServeCommand {
         }
 
         #[cfg(has_mmu_interruption)]
-        let timer_wheel = self.using_mmu_interruption().then(|| {
-            let mut wheel = wasmtime::TimerWheelInterrupter::new();
-            if let Some(timeout) = self.run.common.wasm.timeout {
-                let timeslice = EPOCH_INTERRUPT_PERIOD.min(timeout);
-                wheel = wheel.with_timeslice(timeslice).with_resolution(
-                    timeslice.min(wasmtime::TimerWheelInterrupter::DEFAULT_RESOLUTION),
-                );
+        let _mmu_ticker_thread = match (self.using_mmu_interruption(), self.run.common.wasm.timeout)
+        {
+            (false, _) => None,
+            (true, None) => {
+                config.with_mmu_interrupter(Arc::new(wasmtime::TimingWheelInterrupter::new(0)));
+                None
             }
-            let wheel = Arc::new(wheel);
-            config.with_mmu_interrupter(wheel.clone());
-            wheel
-        });
+            (true, Some(timeout)) => {
+                let timeslice = EPOCH_INTERRUPT_PERIOD.min(timeout);
+                let interval = timeslice.min(MMU_TICK_PERIOD);
+                let ticks = u32::try_from(timeslice.as_nanos().div_ceil(interval.as_nanos()))?;
+                let wheel = Arc::new(wasmtime::TimingWheelInterrupter::new(ticks));
+                config.with_mmu_interrupter(wheel.clone());
+                Some(TickerThread::spawn(interval, move || wheel.tick()))
+            }
+        };
 
         let engine = Engine::new(&config)?;
         let mut linker = Linker::new(&engine);
@@ -602,30 +606,14 @@ impl ServeCommand {
             RunTarget::Component(c) => c,
         };
 
-        #[cfg(has_mmu_interruption)]
-        if let Some(wheel) = &timer_wheel
-            && self.run.common.wasm.timeout.is_some()
-        {
-            wheel.start();
-        }
-
         #[cfg(feature = "debug")]
-        let result = match debug_run {
-            Some(debug_run) => {
-                self.serve_under_debugger(debug_run, linker, component)
-                    .await
-            }
-            None => self.serve_maybe_debug(linker, component, None).await,
-        };
-        #[cfg(not(feature = "debug"))]
-        let result = self.serve_maybe_debug(linker, component, None).await;
-
-        #[cfg(has_mmu_interruption)]
-        if let Some(wheel) = &timer_wheel {
-            wheel.stop();
+        if let Some(debug_run) = debug_run {
+            return self
+                .serve_under_debugger(debug_run, linker, component)
+                .await;
         }
 
-        result
+        self.serve_maybe_debug(linker, component, None).await
     }
 
     async fn serve_maybe_debug(
@@ -702,7 +690,10 @@ impl ServeCommand {
         } else {
             None
         };
-        let _epoch_thread = epoch_interval.map(|t| EpochThread::spawn(t, engine.clone()));
+        let _epoch_thread = epoch_interval.map(|t| {
+            let engine = engine.clone();
+            TickerThread::spawn(t, move || engine.increment_epoch())
+        });
 
         let max_instance_reuse_count = self.max_instance_reuse_count.unwrap_or_else(|| {
             if let ProxyPre::P3(_) = &instance {
@@ -1011,30 +1002,35 @@ impl GracefulShutdown {
 /// epoch period will be used.
 const EPOCH_INTERRUPT_PERIOD: Duration = Duration::from_millis(50);
 
-struct EpochThread {
+/// The longest interval between ticks of the MMU interrupter
+#[cfg(has_mmu_interruption)]
+const MMU_TICK_PERIOD: Duration = Duration::from_millis(10);
+
+/// Calls a function periodically until dropped
+struct TickerThread {
     shutdown: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl EpochThread {
-    fn spawn(interval: std::time::Duration, engine: Engine) -> Self {
+impl TickerThread {
+    fn spawn(interval: std::time::Duration, tick: impl Fn() + Send + 'static) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = {
             let shutdown = Arc::clone(&shutdown);
             let handle = std::thread::spawn(move || {
                 while !shutdown.load(Ordering::Relaxed) {
                     std::thread::sleep(interval);
-                    engine.increment_epoch();
+                    tick();
                 }
             });
             Some(handle)
         };
 
-        EpochThread { shutdown, handle }
+        TickerThread { shutdown, handle }
     }
 }
 
-impl Drop for EpochThread {
+impl Drop for TickerThread {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             self.shutdown.store(true, Ordering::Relaxed);

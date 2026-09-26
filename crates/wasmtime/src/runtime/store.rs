@@ -2129,11 +2129,11 @@ impl StoreOpaque {
     fn release_interrupt_page(&mut self) {
         // See comment in `acquire_interrupt_page()` establishing the
         // lack of races here.
-        let handle = self
-            .mmu_interrupt_page_handle
-            .take()
-            .expect("attempted to detach an interrupt page from a store, but none was attached");
-        self.mmu_interrupter().release_page(handle);
+        drop(
+            self.mmu_interrupt_page_handle.take().expect(
+                "attempted to detach an interrupt page from a store, but none was attached",
+            ),
+        );
         self.vm_store_context.mmu_interrupt_page_ptr = None;
     }
 

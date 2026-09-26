@@ -116,7 +116,9 @@ pub use crate::runtime::vm::memory::{
 };
 pub use crate::runtime::vm::mmap_vec::MmapVec;
 #[cfg(has_mmu_interruption)]
-pub use crate::runtime::vm::mmu_interruption::{MmuInterrupter, PageHandle, TimerWheelInterrupter};
+pub use crate::runtime::vm::mmu_interruption::{
+    MmuInterrupter, PageHandle, TimingWheelInterrupter,
+};
 pub use crate::runtime::vm::provenance::*;
 pub use crate::runtime::vm::stack_switching::*;
 pub use crate::runtime::vm::store_box::*;

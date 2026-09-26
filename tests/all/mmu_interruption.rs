@@ -5,6 +5,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::ptr::null;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use wasmtime::{Config, Engine, Module, Result};
 #[cfg(all(
@@ -12,6 +14,7 @@ use wasmtime::{Config, Engine, Module, Result};
     target_os = "linux"
 ))]
 use wasmtime::{Instance, Store};
+use wasmtime::{MmuInterrupter, PageHandle, TimingWheelInterrupter};
 use wasmtime_environ::obj::ELF_WASMTIME_TRAPS;
 use wasmtime_environ::{CompiledTrap, iterate_traps};
 use wasmtime_test_macros::wasmtime_test;
@@ -79,8 +82,6 @@ mod armable {
                 Box::new(TestPage(page as usize))
             }
         }
-
-        fn release_page(&self, _page: Box<dyn PageHandle>) {}
     }
 
     impl Drop for ArmableInterrupter {
@@ -437,16 +438,16 @@ async fn host_func_runs_without_interrupter(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
-// Shows that, like an unincremented epoch, an unstarted `TimerWheel` never
-// interrupts, letting Wasm run to completion.
+// Shows that, like an unincremented epoch, an unticked `TimingWheelInterrupter`
+// never interrupts, letting Wasm run to completion.
 #[cfg(all(
     any(target_arch = "x86_64", target_arch = "aarch64"),
     target_os = "linux"
 ))]
 #[wasmtime_test(strategies(only(CraneliftNative)))]
-async fn unstarted_timer_wheel_runs_wasm(config: &mut Config) -> Result<()> {
+async fn unticked_timing_wheel_runs_wasm(config: &mut Config) -> Result<()> {
     config.mmu_interruption(true);
-    config.with_mmu_interrupter(Arc::new(wasmtime::TimerWheelInterrupter::new()));
+    config.with_mmu_interrupter(Arc::new(wasmtime::TimingWheelInterrupter::new(0)));
     let engine = Engine::new(config)?;
     let module = Module::new(
         &engine,
@@ -461,6 +462,100 @@ async fn unstarted_timer_wheel_runs_wasm(config: &mut Config) -> Result<()> {
     let instance = Instance::new_async(&mut store, &module, &[]).await?;
     let one = instance.get_typed_func::<(), i32>(&mut store, "one")?;
     assert_eq!(one.call_async(&mut store, ()).await?, 1);
+    Ok(())
+}
+
+// Shows that a ticked `TimingWheelInterrupter` interrupts a busy loop but only
+// after it has run for at least the timeslice.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_os = "linux"
+))]
+#[wasmtime_test(strategies(only(CraneliftNative)))]
+async fn timing_wheel_interrupts_after_timeslice(config: &mut Config) -> Result<()> {
+    const TIMESLICE: u32 = 3;
+    const TOTAL_TICKS: u32 = 20;
+
+    /// Records how many ticks each page was held for
+    #[derive(Default)]
+    struct Ticks {
+        count: AtomicU32,
+        acquired_at: AtomicU32,
+        held: Mutex<Vec<u32>>,
+    }
+
+    struct Counted {
+        wheel: TimingWheelInterrupter,
+        ticks: Arc<Ticks>,
+    }
+
+    struct CountedPage {
+        inner: Box<dyn PageHandle>,
+        ticks: Arc<Ticks>,
+    }
+
+    impl PageHandle for CountedPage {
+        fn page_ptr(&self) -> std::ptr::NonNull<std::ffi::c_void> {
+            self.inner.page_ptr()
+        }
+    }
+
+    impl Drop for CountedPage {
+        fn drop(&mut self) {
+            let held = self.ticks.count.load(SeqCst) - self.ticks.acquired_at.load(SeqCst);
+            self.ticks.held.lock().unwrap().push(held);
+        }
+    }
+
+    impl MmuInterrupter for Counted {
+        fn acquire_page(&self) -> Box<dyn PageHandle> {
+            self.ticks
+                .acquired_at
+                .store(self.ticks.count.load(SeqCst), SeqCst);
+            Box::new(CountedPage {
+                inner: self.wheel.acquire_page(),
+                ticks: self.ticks.clone(),
+            })
+        }
+    }
+
+    let ticks = Arc::new(Ticks::default());
+    let counted = Arc::new(Counted {
+        wheel: TimingWheelInterrupter::new(TIMESLICE),
+        ticks: ticks.clone(),
+    });
+    config.mmu_interruption(true);
+    config.with_mmu_interrupter(counted.clone());
+    let engine = Engine::new(config)?;
+    let module = Module::new(
+        &engine,
+        r#"(module
+             (import "" "tick" (func $tick (result i32)))
+             (func (export "spin")
+                (loop (br_if 0 (i32.eqz (call $tick))))
+             )
+           )"#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    let tick = wasmtime::Func::wrap(&mut store, {
+        let counted = counted.clone();
+        move || {
+            counted.wheel.tick();
+            i32::from(counted.ticks.count.fetch_add(1, SeqCst) + 1 >= TOTAL_TICKS)
+        }
+    });
+    let instance = Instance::new_async(&mut store, &module, &[tick.into()]).await?;
+    let spin = instance.get_typed_func::<(), ()>(&mut store, "spin")?;
+    ticks.held.lock().unwrap().clear();
+
+    spin.call_async(&mut store, ()).await?;
+
+    let held = ticks.held.lock().unwrap();
+    assert!(held.len() > 1, "the loop should have been interrupted");
+    // The last release is the call finishing, not an interruption.
+    for interrupted in &held[..held.len() - 1] {
+        assert_eq!(*interrupted, TIMESLICE + 1);
+    }
     Ok(())
 }
 
