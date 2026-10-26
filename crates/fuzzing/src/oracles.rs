@@ -1146,9 +1146,20 @@ pub fn call_async(wasm: &[u8], config: &generators::Config, mut poll_amts: &[u32
     // is required because the wasm isn't otherwise guaranteed to necessarily
     // call any imports which will also increment the epoch.
     let mut helper_thread = HelperThread::default();
-    if let generators::AsyncConfig::YieldWithEpochs { dur, .. } = &config.wasmtime.async_config {
-        let engine = store.engine().clone();
-        helper_thread.run_periodically(*dur, move || engine.increment_epoch());
+    match &config.wasmtime.async_config {
+        generators::AsyncConfig::YieldWithEpochs { dur, .. } => {
+            let engine = store.engine().clone();
+            helper_thread.run_periodically(*dur, move || engine.increment_epoch());
+        }
+        generators::AsyncConfig::YieldWithMmu {
+            wheel,
+            dur: tick_interval,
+            ..
+        } => {
+            let wheel = wheel.arc.clone();
+            helper_thread.run_periodically(*tick_interval, move || wheel.tick());
+        }
+        _ => {}
     }
 
     // Generate a `Linker` where all function imports are custom-built to yield

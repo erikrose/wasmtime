@@ -1,11 +1,13 @@
 //! Generate a configuration for both Wasmtime and the Wasm module to execute.
 
 use super::{AsyncConfig, CodegenSettings, InstanceAllocationStrategy, MemoryConfig, ModuleConfig};
+use crate::generators::async_config::EqualWheel;
 use crate::oracles::{StoreLimits, Timeout};
 use arbitrary::{Arbitrary, Unstructured};
 use std::num::NonZeroU32;
 use std::time::Duration;
 use wasmtime::Result;
+use wasmtime::TimingWheelInterrupter;
 use wasmtime::{Enabled, Engine, Module, Store};
 use wasmtime_test_util::wast::{WastConfig, WastTest, limits};
 
@@ -521,6 +523,9 @@ impl Config {
                 store.set_epoch_deadline(ticks);
                 store.epoch_deadline_async_yield_and_update(ticks);
             }
+            AsyncConfig::YieldWithMmu { .. } => {
+                // There's no per-store config to set up.
+            }
         }
     }
 
@@ -571,13 +576,34 @@ impl Config {
             self.wasmtime.async_config =
                 AsyncConfig::YieldWithFuel(u.int_in_range(1000..=100_000)?);
             self.wasmtime.consume_fuel = true;
-        } else {
-            self.wasmtime.async_config = AsyncConfig::YieldWithEpochs {
-                dur: Duration::from_millis(u.int_in_range(1..=10)?),
-                ticks: u.int_in_range(1..=10)?,
-            };
-            self.wasmtime.epoch_interruption = true;
+            return Ok(());
         }
+        if wasmtime::Config::is_mmu_interruption_runtime_available()
+            && matches!(
+                self.wasmtime.compiler_strategy,
+                CompilerStrategy::CraneliftNative
+            )
+            && self.wasmtime.signals_based_traps
+            && u.arbitrary()?
+        {
+            // Relatively short choices here exercise interruptions more often.
+            let ticks = u.int_in_range(1..=5)?;
+            let quarantine_ticks = u.int_in_range(1..=10)?;
+            self.wasmtime.async_config = AsyncConfig::YieldWithMmu {
+                ticks_per_interrupt: ticks,
+                cycles_of_cooldown: u.int_in_range(1..=2)?,
+                dur: Duration::from_millis(u.int_in_range(1..=5)?),
+                wheel: EqualWheel {
+                    arc: std::sync::Arc::new(TimingWheelInterrupter::new(ticks, quarantine_ticks)),
+                },
+            };
+            return Ok(());
+        }
+        self.wasmtime.async_config = AsyncConfig::YieldWithEpochs {
+            dur: Duration::from_millis(u.int_in_range(1..=10)?),
+            ticks: u.int_in_range(1..=10)?,
+        };
+        self.wasmtime.epoch_interruption = true;
         Ok(())
     }
 }
@@ -710,7 +736,7 @@ impl WasmtimeConfig {
                     config.config.threads_enabled = false;
                 }
 
-                // Tuning  the following engine options is currently not supported
+                // Tuning the following engine options is currently not supported
                 // by Winch.
                 self.signals_based_traps = true;
                 self.table_lazy_init = true;
