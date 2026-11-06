@@ -10,6 +10,9 @@
 #![deny(missing_docs)]
 #![warn(clippy::cast_sign_loss)]
 #![no_std]
+// `define_vm_type_offsets!` recurses once per field of the largest VM type,
+// taking it over the default macro recursion limit of 128.
+#![recursion_limit = "150"]
 
 #[cfg(any(feature = "std", test))]
 #[macro_use]
