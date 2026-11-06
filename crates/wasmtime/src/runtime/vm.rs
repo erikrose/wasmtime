@@ -59,6 +59,8 @@ mod imports;
 mod instance;
 mod memory;
 mod mmap_vec;
+#[cfg(all(feature = "async", feature = "std"))]
+mod mmu_interruption;
 #[cfg(has_virtual_memory)]
 mod pagemap_disabled;
 mod provenance;
@@ -113,6 +115,10 @@ pub use crate::runtime::vm::interpreter::*;
 pub use crate::runtime::vm::memory::WATCH_DEBUG;
 pub use crate::runtime::vm::memory::{Memory, ShadowMemory, SharedMemory};
 pub use crate::runtime::vm::mmap_vec::MmapVec;
+#[cfg(all(feature = "async", feature = "std"))]
+pub use crate::runtime::vm::mmu_interruption::{
+    MmuInterrupter, PageHandle, TimingWheelInterrupter,
+};
 pub use crate::runtime::vm::provenance::*;
 pub use crate::runtime::vm::stack_switching::*;
 pub use crate::runtime::vm::store_box::*;

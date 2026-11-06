@@ -91,6 +91,7 @@ impl WizerCommand {
             module_and_args: vec![self.input.clone().into()],
             preloads: self.preloads.clone(),
             module_bytes: None,
+            timing_wheel: None,
         };
         let engine = run.new_engine()?;
 

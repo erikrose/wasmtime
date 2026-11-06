@@ -24,6 +24,9 @@ use crate::stack::{StackCreator, StackCreatorProxy};
 #[cfg(feature = "async")]
 use wasmtime_fiber::RuntimeFiberStackCreator;
 
+#[cfg(all(feature = "async", feature = "std"))]
+use crate::runtime::vm::MmuInterrupter;
+
 #[cfg(feature = "runtime")]
 pub use crate::runtime::code_memory::CustomCodeMemory;
 #[cfg(feature = "cache")]
@@ -167,6 +170,10 @@ pub struct Config {
     pub(crate) mem_creator: Option<Arc<dyn MemoryCreator>>,
     #[cfg(feature = "runtime")]
     pub(crate) custom_code_memory: Option<Arc<dyn CustomCodeMemory>>,
+    /// Required, when running guest code, if the `mmu_interruption` tunable is
+    /// true
+    #[cfg(all(feature = "async", feature = "std"))]
+    pub(crate) mmu_interrupter: Option<Arc<dyn MmuInterrupter>>,
     pub(crate) allocation_strategy: InstanceAllocationStrategy,
     pub(crate) max_wasm_stack: usize,
     /// Explicitly enabled features via `Config::wasm_*` methods. This is a
@@ -279,6 +286,8 @@ impl Config {
             mem_creator: None,
             #[cfg(feature = "runtime")]
             custom_code_memory: None,
+            #[cfg(all(feature = "async", feature = "std"))]
+            mmu_interrupter: None,
             allocation_strategy: InstanceAllocationStrategy::OnDemand,
             // 512k of stack -- note that this is chosen currently to not be too
             // big, not be too small, and be a good default for most platforms.
@@ -705,7 +714,11 @@ impl Config {
     /// signal handler), then we can ensure that all async code will
     /// yield to the executor within a bounded time.
     ///
-    /// The [`Store`](crate::Store) tracks the deadline, and controls
+    /// The deadline check cannot be avoided by malicious wasm code. It is safe
+    /// to use epoch deadlines to limit the execution time of untrusted
+    /// code.
+    ///
+    /// The [`Store`](crate::Store) tracks the deadline and controls
     /// what happens when the deadline is reached during
     /// execution. Several behaviors are possible:
     ///
@@ -1895,6 +1908,18 @@ impl Config {
         self
     }
 
+    /// Sets the [`MmuInterrupter`](crate::MmuInterrupter) that schedules
+    /// interruptions under [`Config::mmu_interruption`].
+    ///
+    /// It is an error, reported by [`Engine::new`], to set this without also
+    /// enabling [`Config::mmu_interruption`]. Conversely, loading code to run
+    /// with MMU interruption enabled fails if this was not set.
+    #[cfg(all(feature = "async", feature = "std"))]
+    pub fn with_mmu_interrupter(&mut self, interrupter: Arc<dyn MmuInterrupter>) -> &mut Self {
+        self.mmu_interrupter = Some(interrupter);
+        self
+    }
+
     /// Sets the instance allocation strategy to use.
     ///
     /// This is notably used in conjunction with
@@ -2994,6 +3019,13 @@ impl Config {
                 "MMU interruption requires signals-based traps"
             );
         }
+
+        #[cfg(all(feature = "async", feature = "std"))]
+        ensure!(
+            tunables.mmu_interruption || self.mmu_interrupter.is_none(),
+            "an MMU interrupter was configured, but MMU interruption is not enabled"
+        );
+
         // Concurrency support is required for some component model features.
         let requires_concurrency = WasmFeatures::CM_ASYNC
             | WasmFeatures::CM_MORE_ASYNC_BUILTINS

@@ -631,6 +631,10 @@ impl FiberResumeState {
             .unwrap_or(ptr::null_mut()..ptr::null_mut());
         let mut executor = self.executor;
         store.swap_executor(&mut executor);
+
+        #[cfg(has_mmu_interruption_runtime)]
+        store.increment_fibers();
+
         PriorFiberResumeState {
             tls,
             mpk,
@@ -710,6 +714,9 @@ impl PriorFiberResumeState {
 
         let mut executor = self.executor;
         store.swap_executor(&mut executor);
+
+        #[cfg(has_mmu_interruption_runtime)]
+        store.decrement_fibers();
 
         FiberResumeState {
             tls,

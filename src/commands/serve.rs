@@ -599,6 +599,18 @@ impl ServeCommand {
         Ok(())
     }
 
+    /// Returns whether MMU-based interruption is both requested and usable on this
+    /// host.
+    fn using_mmu_interruption(&self) -> bool {
+        wasmtime::Config::is_mmu_interruption_runtime_available()
+            && self.run.common.wasm.mmu_interruption == Some(true)
+    }
+
+    /// Returns whether we're using MMU interruption to effect timeouts.
+    fn using_mmu_timeout(&self) -> bool {
+        self.using_mmu_interruption() && self.run.common.wasm.timeout.is_some()
+    }
+
     async fn serve(mut self) -> Result<()> {
         #[cfg(feature = "debug")]
         let debug_run = self.debugger_setup()?;
@@ -609,7 +621,9 @@ impl ServeCommand {
             .config(use_pooling_allocator_by_default().unwrap_or(None))?;
         config.wasm_component_model(true);
 
-        if self.run.common.wasm.timeout.is_some() || self.post_return_timeout.is_some() {
+        if (self.run.common.wasm.timeout.is_some() || self.post_return_timeout.is_some())
+            && !self.using_mmu_interruption()
+        {
             config.epoch_interruption(true);
         }
 
@@ -622,6 +636,23 @@ impl ServeCommand {
             }
             None => {}
         }
+
+        let _mmu_ticker_thread = match (self.using_mmu_interruption(), self.run.common.wasm.timeout)
+        {
+            (false, _) => None,
+            (true, None) => {
+                config.with_mmu_interrupter(Arc::new(wasmtime::TimingWheelInterrupter::new(0)));
+                None
+            }
+            (true, Some(timeout)) => {
+                let timeslice = EPOCH_INTERRUPT_PERIOD.min(timeout);
+                let interval = timeslice.min(MMU_TICK_PERIOD);
+                let ticks = u32::try_from(timeslice.as_nanos().div_ceil(interval.as_nanos()))?;
+                let wheel = Arc::new(wasmtime::TimingWheelInterrupter::new(ticks));
+                config.with_mmu_interrupter(wheel.clone());
+                Some(TickerThread::spawn(interval, move || wheel.tick()))
+            }
+        };
 
         let engine = Engine::new(&config)?;
         let mut linker = Linker::new(&engine);
@@ -736,12 +767,15 @@ impl ServeCommand {
             }
         };
 
+        // We always use epoch interruption for profiling and debugging because
+        // MMU interruption doesn't support arbitrary callbacks.
         let epoch_interval = if let Some(Profile::Guest { interval, .. }) = self.run.profile {
             Some(interval)
         } else if let Some(t) = [self.run.common.wasm.timeout, self.post_return_timeout]
             .into_iter()
             .flatten()
             .min()
+            && !self.using_mmu_timeout()
         {
             Some(EPOCH_INTERRUPT_PERIOD.min(t))
         } else if debuggee_store.is_some() {
@@ -749,7 +783,10 @@ impl ServeCommand {
         } else {
             None
         };
-        let _epoch_thread = epoch_interval.map(|t| EpochThread::spawn(t, engine.clone()));
+        let _epoch_thread = epoch_interval.map(|_t| {
+            let engine = engine.clone();
+            TickerThread::spawn(Duration::from_micros(500), move || engine.increment_epoch())
+        });
 
         let max_instance_reuse_count = self.max_instance_reuse_count.unwrap_or_else(|| {
             if let ProxyPre::P3(_) = &instance {
@@ -1244,34 +1281,39 @@ mod shutdown {
 }
 
 /// When executing with a timeout enabled, this is how frequently epoch
-/// interrupts will be executed to check for timeouts. If guest profiling
-/// is enabled, the guest epoch period will be used.
-const EPOCH_INTERRUPT_PERIOD: Duration = Duration::from_millis(50);
+/// interrupts will be executed to check for timeouts. It also sets a ceiling on
+/// the MMU interruption timeslice. If guest profiling is enabled, the guest
+/// epoch period will be used.
+const EPOCH_INTERRUPT_PERIOD: Duration = Duration::from_millis(5);
 
-struct EpochThread {
+/// The longest interval between ticks of the MMU interrupter
+const MMU_TICK_PERIOD: Duration = Duration::from_micros(500);
+
+/// Calls a function periodically until dropped
+struct TickerThread {
     shutdown: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl EpochThread {
-    fn spawn(interval: std::time::Duration, engine: Engine) -> Self {
+impl TickerThread {
+    fn spawn(interval: std::time::Duration, tick: impl Fn() + Send + 'static) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = {
             let shutdown = Arc::clone(&shutdown);
             let handle = std::thread::spawn(move || {
                 while !shutdown.load(Ordering::Relaxed) {
                     std::thread::sleep(interval);
-                    engine.increment_epoch();
+                    tick();
                 }
             });
             Some(handle)
         };
 
-        EpochThread { shutdown, handle }
+        TickerThread { shutdown, handle }
     }
 }
 
-impl Drop for EpochThread {
+impl Drop for TickerThread {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             self.shutdown.store(true, Ordering::Relaxed);
@@ -1302,8 +1344,8 @@ fn setup_epoch_handler(state: &HostHandlerState, store: &mut Store<Host>) -> Res
     }
 
     // Profiling disabled but there's a global request or post-return timeout
-    if cmd.run.common.wasm.timeout.is_some()
-        || cmd.post_return_timeout.is_some()
+    if ((cmd.run.common.wasm.timeout.is_some() || cmd.post_return_timeout.is_some())
+        && !cmd.using_mmu_timeout())
         || cmd.run.common.debug.debugger.is_some()
     {
         store.epoch_deadline_async_yield_and_update(1);

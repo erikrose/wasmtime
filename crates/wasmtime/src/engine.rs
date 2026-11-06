@@ -413,6 +413,12 @@ impl Engine {
             if !cfg!(has_mmu_interruption_runtime) {
                 return Err("MMU interruption runtime support was disabled at compile time".into());
             }
+
+            #[cfg(all(feature = "async", feature = "std"))]
+            if self.config().mmu_interrupter.is_none() {
+                return Err("MMU interruption requires an MMU interrupter; see `Config::with_mmu_interrupter()`"
+                    .into());
+            }
         }
 
         if !cfg!(has_virtual_memory) && self.tunables().memory_init_cow {
@@ -887,6 +893,12 @@ impl Engine {
     #[cfg(feature = "runtime")]
     pub(crate) fn custom_code_memory(&self) -> Option<&Arc<dyn CustomCodeMemory>> {
         self.config().custom_code_memory.as_ref()
+    }
+
+    /// Returns the interrupter shared by this engine's stores, if one was configured.
+    #[cfg(has_mmu_interruption_runtime)]
+    pub(crate) fn mmu_interrupter(&self) -> Option<&dyn crate::runtime::vm::MmuInterrupter> {
+        self.config().mmu_interrupter.as_deref()
     }
 
     #[cfg(target_has_atomic = "64")]
