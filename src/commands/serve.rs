@@ -641,14 +641,14 @@ impl ServeCommand {
         {
             (false, _) => None,
             (true, None) => {
-                config.with_mmu_interrupter(Arc::new(wasmtime::TimingWheelInterrupter::new(0)));
+                config.with_mmu_interrupter(Arc::new(wasmtime::TimingWheelInterrupter::new(0, 1)));
                 None
             }
             (true, Some(timeout)) => {
                 let timeslice = EPOCH_INTERRUPT_PERIOD.min(timeout);
                 let interval = timeslice.min(MMU_TICK_PERIOD);
                 let ticks = u32::try_from(timeslice.as_nanos().div_ceil(interval.as_nanos()))?;
-                let wheel = Arc::new(wasmtime::TimingWheelInterrupter::new(ticks));
+                let wheel = Arc::new(wasmtime::TimingWheelInterrupter::new(ticks, ticks));
                 config.with_mmu_interrupter(wheel.clone());
                 Some(TickerThread::spawn(interval, move || wheel.tick()))
             }

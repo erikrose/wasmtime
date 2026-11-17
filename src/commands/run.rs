@@ -361,7 +361,7 @@ impl RunCommand {
         }
 
         if wasm_options.mmu_interruption == Some(true) {
-            let wheel = std::sync::Arc::new(wasmtime::TimingWheelInterrupter::new(1));
+            let wheel = std::sync::Arc::new(wasmtime::TimingWheelInterrupter::new(1, 2));
             config.with_mmu_interrupter(wheel.clone());
             self.timing_wheel = Some(wheel);
         }

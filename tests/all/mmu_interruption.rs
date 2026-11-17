@@ -446,7 +446,7 @@ async fn host_func_runs_without_interrupter(config: &mut Config) -> Result<()> {
 #[wasmtime_test(strategies(only(CraneliftNative)))]
 async fn unticked_timing_wheel_runs_wasm(config: &mut Config) -> Result<()> {
     config.mmu_interruption(true);
-    config.with_mmu_interrupter(Arc::new(wasmtime::TimingWheelInterrupter::new(0)));
+    config.with_mmu_interrupter(Arc::new(wasmtime::TimingWheelInterrupter::new(0, 1)));
     let engine = Engine::new(config)?;
     let module = Module::new(
         &engine,
@@ -520,7 +520,7 @@ async fn timing_wheel_interrupts_after_timeslice(config: &mut Config) -> Result<
 
     let ticks = Arc::new(Ticks::default());
     let counted = Arc::new(Counted {
-        wheel: TimingWheelInterrupter::new(TIMESLICE),
+        wheel: TimingWheelInterrupter::new(TIMESLICE, 1),
         ticks: ticks.clone(),
     });
     config.mmu_interruption(true);
